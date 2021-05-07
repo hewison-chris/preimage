@@ -1,0 +1,559 @@
+module preimage;
+
+import std.algorithm;
+import std.array;
+import std.range;
+import std.stdio;
+
+@safe:
+
+const string NODE2 = "NODE2";
+
+static assumeNothrow (T)(lazy T exp) nothrow
+{
+    try return exp();
+    catch (Exception ex) assert(0, ex.msg);
+}
+
+const ulong HashInit = 1_000_000;
+const uint EnrollCycle = 2;
+private struct Hash
+{
+    private ulong value = HashInit;
+
+    static Height imageToHeight (Hash image)
+    {
+        return Height((EnrollCycle * PreImageCycle.NumberOfCycles) - image.value - 1);
+    }
+}
+
+unittest
+{
+    assert(Hash.init.value == HashInit);
+}
+
+public Hash hashFull (in Hash h) nothrow @nogc
+{
+    return Hash(h.value + 1);
+}
+
+public Hash hashMulti (Scalar secret, in string ignore, uint nonce) nothrow @nogc @safe
+{
+    return Hash(nonce * 1_000);
+}
+
+private struct Scalar
+{
+    string name;
+}
+
+/// A type to ensure that height and other integer values aren't mixed
+public struct Height
+{
+    ///
+    public ulong value;
+
+    /// Provides implicit conversion to `ulong`
+    public alias value this;
+
+    /// Prevent needing to cast when using unary post plus operator
+    public Height opUnary (string op) () if (op == "++")
+    {
+        return Height(this.value++);
+    }
+
+    /// Allow to offset an height by a fixed number
+    public Height opBinary (string op : "+") (ulong offset) const
+    {
+        return Height(this.value + offset);
+    }
+
+    /// Allow to offset an height by a fixed number
+    public ref Height opBinaryAssign (string op : "+=") (ulong offset) return
+    {
+        this.value += offset;
+        return this;
+    }
+}/*******************************************************************************
+
+    Helper struct to manage a range of pre-images
+
+    When dealing with pre-images, the only unrecoverable data is the seed.
+    Everything else is, by definition, derived from the seed.
+    As a result, we can compress the data as much as we want,
+    to reduce memory usage. However, this comes at the cost of more computation.
+
+    For example, if we have cycles of 10 pre-images, we can first compute the
+    seed (H0), then reveal our initial commitment (H9). This will cost us
+    9 hash operations. Then on the next reveal, in order to get H8, we need to
+    perform 8 hash operations, then 7 for H7, etc...
+
+    If we want to improve this, we can store intermediate results:
+    when generating H9, we do perform 9 hash operations, but store H5.
+    Hence, when generating H8 and H7, we only need to perform
+    3 and 2 hash operations, respectively, and will never need to perform more
+    than 4 operations (save the initial commitment).
+
+    This structure is a mean to generalize this approach, with arbitrary count
+    and arbitrary sample size (interval, or distance, between saved pre-images).
+
+*******************************************************************************/
+
+public struct PreImageCache
+{
+    nothrow:
+
+    /// Store the actual preimages
+    private Hash[] data;
+
+    /// Interval between two preimages in `data`
+    private const ulong interval;
+
+    /// Default-initialized `PreImageCache` is not valid, make sure it can't
+    /// be accidentally constructed (e.g. by embbeding it in another aggregate)
+    @disable public this ();
+
+    /// Construct an instance using already existing data
+    public this (inout(Hash)[] data_, ulong sample_size) inout @nogc pure
+    {
+        assert(sample_size > 0, "The distance must be at least 1");
+
+        this.data = data_;
+        this.interval = sample_size;
+    }
+
+    /***************************************************************************
+
+        Construct an instance and allocate memory
+
+        This takes a `count` of pre-image and a sample size, or distance.
+        For example, if one wishes to represent a range of 1000 pre-images with
+        this cache, and perform no more than 5 hash operations each time,
+        the `sample_size` should be `5` and the `count` should be `200`
+        (1000 / 5).
+
+        Params:
+          count = Number of samples to store (number of entries in the array)
+          sample_size = Distance between two pre-images. If the value 1 is
+                        provided, the pre-images will be consecutives and
+                        this struct will behave essentially like an array.
+
+    ***************************************************************************/
+
+    public this (ulong count, ulong sample_size) pure
+    {
+        assert(count > 1, "A count of less than 2 does not make sense");
+        this(new Hash[](count), sample_size);
+    }
+
+    /***************************************************************************
+
+        Populate this cache from the `seed`
+
+        Params:
+          seed = Initial value to derive preimage from. This will always be the
+                 first value of the array.
+          length = The number of entries to populate.
+                   This can be used when large sample size are used,
+                   and one wishes to stop initialization past a certain threshold.
+
+    ***************************************************************************/
+
+    public void reset (in Hash seed, size_t length)
+    {
+        // Set the length, so that extra entries are not accessible through
+        // `opIndex`
+        assert(length > 0, "The length of the array should be at least 1");
+        this.data.length = length;
+        () @trusted { assumeSafeAppend(this.data); }();
+        this.reset(seed);
+    }
+
+    /// Ditto
+    public void reset (Hash seed) @nogc
+    {
+        this.data[0] = seed;
+        foreach (ref entry; this.data[1 .. $])
+        {
+            foreach (idx; 0 .. this.interval)
+                seed = hashFull(seed);
+            entry = seed;
+        }
+    }
+
+    /***************************************************************************
+
+        Get the hash at index `idx` in the cycle
+
+        Will perform at most `cycle_length % interval` computations.
+
+    ***************************************************************************/
+
+    public Hash opIndex (size_t index) const @nogc
+    {
+        immutable startIndex = (index / this.interval);
+        // This will trigger out of bound if needed
+        // We could possibly silently allow to index arbitrarily outside the
+        // array by just taking the computational hit, since indexing past the
+        // end means we are generating new pre-images, but it sounds like abuse
+        Hash value = this.data[startIndex];
+        foreach (_; (startIndex * this.interval) .. index)
+            value = hashFull(value);
+        return value;
+    }
+
+    /// Alias to the underlying data, useful when dealing with multiple levels
+    public const(Hash)[] byStride () const pure @nogc { return this.data; }
+
+    /// Returns: The number of preimages this cache can represent
+    public size_t length () const pure nothrow @nogc @safe
+    {
+        return this.interval * this.data.length;
+    }
+
+    /// Ditto
+    alias opDollar = length;
+}
+
+///
+unittest
+{
+    Hash[32] data;
+    data[0] = hashFull(Hash(0));
+    foreach (idx, ref entry; data[1 .. $])
+        entry = hashFull(data[idx]);
+
+    // First case and last two are degenerate
+    immutable intervals = [1, 2, 4, 8, 16];
+    foreach (interval; intervals)
+    {
+        auto cache = PreImageCache(data.length / interval, interval);
+        cache.reset(data[0]);
+        foreach (idx, const ref value; data)
+            assert(value == cache[idx]);
+
+        // Test `length` and `$` properties
+        assert(cache[$-1] == data[$-1]);
+        assert(cache[cache.length - 1] == data[$-1]);
+
+        switch (interval)
+        {
+        case 32:
+        case 16:
+        case 8:
+        case 4:
+        case 2:
+        case 1:
+            assert(cache.data.length == (32 / interval));
+            size_t data_idx;
+            foreach (idx, const ref entry; cache.data)
+            {
+                assert(entry == data[data_idx]);
+                data_idx += interval;
+            }
+            break;
+
+        case 64:
+            assert(cache.data.length == 1);
+            assert(cache.data[0] == data[0]);
+            break;
+
+        default:
+            assert(0);
+        }
+    }
+}
+
+/*******************************************************************************
+
+    Combines two PreImageCache, allowing for faster lookup
+
+    Nodes generate a large amount of pre-images on startup, then will seek to
+    a certain position in their pre-image chain and use the values sequentially.
+    In order to reduce the space usage of nodes, while ensuring they don't
+    get random delays while seeking pre-images, this struct holds two caches.
+    The `seeds` are sparse values spawing the whole pre-image chain, while the
+    `preimages` are consecutive values for the current cycle.
+
+*******************************************************************************/
+
+public struct PreImageCycle
+{
+    /// Make sure we get initializedby disabling the default ctor
+    @disable public this ();
+
+    /// Construct an instance with the provided cycle length
+    public this (Scalar secret, uint cycle_length) @safe nothrow
+    {
+        this.secret = secret;
+        this.impl = PreImageCycleImpl(
+            /* nonce: */ 0,
+            /* index: */ 0,
+            /* seeds: */ PreImageCache(PreImageCycleImpl.NumberOfCycles, cycle_length),
+            /* preimages: */ PreImageCache(cycle_length, 1),
+        );
+        // Populate the seeds and first cycle
+        this.impl.seek(this.secret, Height(0));
+        assumeNothrow(writefln("PreImageCycle: Height 0 preimage = %s", this[Height(0)]));
+        assumeNothrow(writefln("PreImageCycle: %s", this));
+    }
+
+    /***************************************************************************
+
+        Get a pre-mage at the specified height.
+
+        This routine might first need to seek to the given `height`,
+        hence calls might have various latency depending if the image is
+        cached or not.
+
+        Params:
+          height = Requested height
+
+        Returns:
+            Pre-image at `height`
+
+    ***************************************************************************/
+
+    public Hash opIndex (in Height height) @safe nothrow @nogc
+    {
+        this.impl.seek(this.secret, height);
+        auto offset = height % this.impl.preimages.length();
+        return this.impl.preimages[$ - offset - 1];
+    }
+
+    ///
+    private Scalar secret;
+
+    ///
+    public alias impl this;
+
+    ///
+    public PreImageCycleImpl impl;
+}
+
+/// Ditto
+public struct PreImageCycleImpl
+{
+    @safe nothrow:
+
+    /// Make sure we get initialized by disabling the default ctor
+    @disable public this ();
+
+    /// Re-introduce the all-parameter default ctor
+    public this (typeof(PreImageCycleImpl.tupleof) args) pure @nogc
+    {
+        this.tupleof = args;
+    }
+
+    /// The number of cycles for a bulk of pre-images
+    public static immutable uint NumberOfCycles = 5;
+
+    /***************************************************************************
+
+        The number of the current cycle
+
+        This is the data used as a nonce in generating the cycle seed.
+        Named `nonce` to avoid any ambiguity. It is incremented once every
+        `EnrollPerCycle` period, currently 700 days.
+
+    ***************************************************************************/
+
+    public uint nonce;
+
+    /***************************************************************************
+
+        The index of the enrollment within the current cycle
+
+        This number is incremented every time a new Enrollment is accepted
+        by the consensus protocol, and reset when `nonce` is incremented.
+
+    ***************************************************************************/
+
+    public uint index;
+
+    /***************************************************************************
+
+        Seed for all enrollments for the current cycle
+
+        This variable is changed every time `nonce` is changed,
+        and contains all the roots used to generate the `preimages` value.
+
+    ***************************************************************************/
+
+    public PreImageCache seeds;
+
+    /***************************************************************************
+
+        Currently active list of pre-images
+
+        This variable is changed every time `index` is changed, to reflect
+        the current Enrollment's pre-images.
+
+    ***************************************************************************/
+
+    public PreImageCache preimages;
+
+    /***************************************************************************
+
+        Populate the caches of pre-images
+
+        This will first populate the caches (seeds and preimages) as necessary,
+        then increase the `index` by one, or reset it to 0 and increase `nonce`
+        if necessary.
+
+        Note that the increment is done after the caches are populated,
+        so `populate` needs to be called once this node has confirmed it
+        is part of consensus. If the caches are only needed without the
+        increment, the `consume` parameter must be set to `false`.
+
+        Params:
+          secret = The secret key of the node, used as part of the hash
+                   to generate the cycle seeds
+          consume = If true, calculate the cycle index. Otherwise, just
+                   get the commitment which is the first pre-image
+
+        Returns:
+          The hash of the current enrollment round
+
+    ***************************************************************************/
+
+    // public Hash populate (in Scalar secret, bool consume)
+    // {
+    //     // Populate the nonce cache if necessary
+    //     if (this.index == 0)
+    //     {
+    //         const cycle_seed = hashMulti(
+    //             secret, "consensus.preimages", this.nonce);
+    //         this.seeds.reset(cycle_seed);
+    //     }
+
+    //     if (consume)
+    //     {
+    //         // Populate the current enrollment round cache
+    //         // The index into `seeds` is the absolute index of the cycle,
+    //         // not the number of round, hence why we use `byStrides`
+    //         // The alternative would be:
+    //         // [$ - (this.index + 1) * this.preimages.length]
+    //         this.preimages.reset(this.seeds.byStride[$ - 1 - this.index]);
+
+    //         // Increment index if there are rounds left in this cycle
+    //         this.index += 1;
+    //         if (this.index >= NumberOfCycles)
+    //         {
+    //             this.index = 0;
+    //             this.nonce += 1;
+    //         }
+    //         return this.preimages[$ - 1];
+    //     }
+    //     else
+    //     {
+    //         // If this is used for getting initial pre-image for enrollment
+    //         // it just creates initial pre-image of the cycle seed.
+    //         auto next_images = PreImageCache(
+    //             this.preimages.data.length, this.preimages.interval);
+    //         next_images.reset(this.seeds.byStride[$ - 1 - this.index]);
+    //         return next_images[$ - 1];
+    //     }
+    // }
+
+    /***************************************************************************
+
+        Seek to the `PreImage`s at height `height`
+
+        This will calculate the `index` and `nonce` according to the given
+        height and populate the `seed` and `preimages` if neccesary.
+
+        This will be particularly usefull since the PreImages will now be
+        consumed not by new enrollments but creation of new blocks.
+
+        Params:
+          secret = The secret key of the node, used as part of the hash
+                   to generate the cycle seeds
+          height = Requested height
+
+    ***************************************************************************/
+
+    private void seek (in Scalar secret, in Height height) @nogc
+    {
+        uint seek_index = cast (uint) (height / this.preimages.length());
+        uint seek_nonce = seek_index / NumberOfCycles;
+        seek_index %= NumberOfCycles;
+
+        debug { writefln("%s: enter seek height: %s, PreImageCycle: %s", secret, height, this); }
+        if (this.seeds[0] == Hash.init || seek_nonce != this.nonce)
+        {
+            this.nonce = seek_nonce;
+            this.index = seek_index;
+            debug { writefln("%s: seek height: %s, index updated to: %s", secret, height, this.index); }
+            const cycle_seed = hashMulti(
+                secret, "consensus.preimages", this.nonce);
+            this.seeds.reset(cycle_seed);
+            this.preimages.reset(this.seeds.byStride[$ - 1 - this.index]);
+        }
+        else if (seek_index != this.index)
+        {
+            this.index = seek_index;
+            debug { writefln("%s: seek height: %s, index updated to: %s", secret, height, this.index); }
+            this.preimages.reset(this.seeds.byStride[$ - 1 - this.index]);
+        }
+        debug { writefln("%s: exit seek height: %s, PreImageCycle: %s", secret, height, this); }
+    }
+}
+
+unittest
+{
+    writeln("Testing preimage cycles.");
+    auto cycle_cache = PreImageCycle(Scalar("TESTING"), EnrollCycle);
+    [0,1,5,6,8,10,11].each!(h => writefln("Height: %4s preimage: %4s", h, Hash.imageToHeight(cycle_cache[Height(h)])));
+    writefln("Height: %4s preimage: %4s", 1, Hash.imageToHeight(cycle_cache[Height(1)]));
+}
+
+private struct PublicKey
+{
+    private string name;
+}
+
+private struct KeyPair
+{
+    private Scalar secret;
+    private PublicKey address;
+}
+
+private class CyclesCache
+{
+    private PreImageCycle cycle_cache = PreImageCycle(Scalar("TESTING"), EnrollCycle);
+}
+private CyclesCache[] caches;
+private ulong[PublicKey] publicKeyToIndex;
+
+public PreImageCycle getWellKnownPreimages (KeyPair kp) @safe nothrow
+{
+    if (kp.address !in publicKeyToIndex)
+    {
+        publicKeyToIndex[kp.address] = caches.length;
+        caches ~= new CyclesCache();
+    }
+    return caches[publicKeyToIndex[kp.address]].cycle_cache;
+}
+
+public Hash wellKnownPreimages (Height height, KeyPair kp) @safe nothrow
+{
+    return getWellKnownPreimages(kp)[height];
+}
+
+// Check that cached cycles can handle being used with previous cycle heights
+unittest
+{
+    const secret = Scalar(NODE2);
+    auto NODE2_KP = KeyPair(secret, PublicKey(NODE2));
+    Height preimages_height_0 = Hash.imageToHeight(wellKnownPreimages(Height(0), NODE2_KP));
+    writefln("Seeds: %s", getWellKnownPreimages(NODE2_KP).seeds.data);
+    Height preimages_height_1 = Hash.imageToHeight(wellKnownPreimages(Height(1), NODE2_KP));
+    // fetch from previous height within the first cycle
+    assert(Hash.imageToHeight(wellKnownPreimages(Height(0), NODE2_KP)) == preimages_height_0);
+    // preimage from second cycle
+    Height preimages_height_6 = Hash.imageToHeight(wellKnownPreimages(Height(6), NODE2_KP));
+    // check we can fetch preimages from previous cycle
+    assert(Hash.imageToHeight(wellKnownPreimages(Height(1), NODE2_KP)) == preimages_height_1);
+    assert(Hash.imageToHeight(wellKnownPreimages(Height(6), NODE2_KP)) == preimages_height_6);
+}

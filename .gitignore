@@ -1,0 +1,16 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/preimage
+preimage.so
+preimage.dylib
+preimage.dll
+preimage.a
+preimage.lib
+preimage-test-*
+*.exe
+*.o
+*.obj
+*.lst
+.vscode/

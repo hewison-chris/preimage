@@ -1,0 +1,30 @@
+{
+	"authors": [
+		"Chris Hewison"
+	],
+	"copyright": "Copyright © 2021, Chris Hewison",
+	"description": "testing_preimages",
+	"license": "proprietary",
+	"name": "preimage",
+	"toolchainRequirements": {
+        "dub": "~>1.24",
+	"dmd": "no",
+	"gdc": "no",
+	"ldc": "~>1.25"
+    },
+	"dflags": [ "-extern-std=c++14", "-preview=in" , "-checkaction=context" ],
+    "dflags-ldc": [ "--link-defaultlib-debug" ],
+	"targetType": "executable",
+	"configurations": [
+        {
+            "name": "app",
+            "mainSourceFile": "source/app.d",
+            "sourceFiles": [ "source/app.d" ]
+        },
+        {
+            "name": "unittest",
+            "mainSourceFile": "source/app.d",
+            "sourceFiles": [ "source/app.d" ]
+        }
+    ]
+}
